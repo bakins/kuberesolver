@@ -9,8 +9,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
+	"go.opencensus.io/stats"
+	"go.opencensus.io/stats/view"
+	"go.opencensus.io/tag"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc/grpclog"
 	"google.golang.org/grpc/resolver"
@@ -22,20 +23,35 @@ const (
 )
 
 var (
-	endpointsForTarget = promauto.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "kuberesolver_endpoints_total",
-			Help: "The number of endpoints for a given target",
-		},
-		[]string{"target"},
-	)
-	addressesForTarget = promauto.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "kuberesolver_addresses_total",
-			Help: "The number of addresses for a given target",
-		},
-		[]string{"target"},
-	)
+	targetKey = tag.MustNewKey("target")
+
+	endpointsForTarget = stats.Int64("kuberesolver_endpoints_total", "The number of endpoints for a given target", stats.UnitDimensionless)
+
+	// EndpointsView records the number of endpoints per target.
+	EndpointsView = view.View{
+		Name:        endpointsForTarget.Name(),
+		Description: endpointsForTarget.Description(),
+		TagKeys:     []tag.Key{targetKey},
+		Measure:     endpointsForTarget,
+		Aggregation: view.LastValue(),
+	}
+
+	addressesForTarget = stats.Int64("kuberesolver_addresses_total", "The number of addresses for a given target", stats.UnitDimensionless)
+
+	// AddressesView records the number of addresses per target.
+	AddressesView = view.View{
+		Name:        addressesForTarget.Name(),
+		Description: addressesForTarget.Description(),
+		TagKeys:     []tag.Key{targetKey},
+		Measure:     addressesForTarget,
+		Aggregation: view.LastValue(),
+	}
+
+	// DefaultViews provided by this package.
+	DefaultViews = []*view.View{
+		&EndpointsView,
+		&AddressesView,
+	}
 )
 
 type targetInfo struct {
@@ -150,9 +166,7 @@ func (b *kubeBuilder) Build(target resolver.Target, cc resolver.ClientConn, opts
 		k8sClient: b.k8sClient,
 		t:         time.NewTimer(defaultFreq),
 		freq:      defaultFreq,
-
-		endpoints: endpointsForTarget.WithLabelValues(ti.String()),
-		addresses: addressesForTarget.WithLabelValues(ti.String()),
+		label:     ti.String(),
 	}
 	go until(func() {
 		r.wg.Add(1)
@@ -179,12 +193,10 @@ type kResolver struct {
 	rn        chan struct{}
 	k8sClient K8sClient
 	// wg is used to enforce Close() to return after the watcher() goroutine has finished.
-	wg   sync.WaitGroup
-	t    *time.Timer
-	freq time.Duration
-
-	endpoints prometheus.Gauge
-	addresses prometheus.Gauge
+	wg    sync.WaitGroup
+	t     *time.Timer
+	freq  time.Duration
+	label string
 }
 
 // ResolveNow will be called by gRPC to try to resolve the target name again.
@@ -246,8 +258,14 @@ func (k *kResolver) handle(e Endpoints) {
 		k.cc.NewAddress(result)
 	}
 
-	k.endpoints.Set(float64(len(e.Subsets)))
-	k.addresses.Set(float64(len(result)))
+	m := []tag.Mutator{
+		tag.Upsert(targetKey, k.label),
+	}
+
+	stats.RecordWithTags(context.Background(), m,
+		endpointsForTarget.M(int64(len(e.Subsets))),
+		addressesForTarget.M(int64(len(result))),
+	)
 }
 
 func (k *kResolver) resolve() {
